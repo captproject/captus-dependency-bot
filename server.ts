@@ -529,7 +529,78 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
 
     // ── Step 9: Select Target Risk ─────────────────────────────────────────
     console.log(`[Dep] Selecting target risk: "${input.targetTitle}"...`);
-    const targetSelected = await selectDropdown(page, "select-target-risk", input.targetTitle);
+
+    // Target dropdown excludes the source risk — use partial text match
+    // Option text includes score like "Dep_Target_20260323 (Score: 9)"
+    const targetTrigger = page.getByTestId("select-target-risk");
+    let targetSelected = false;
+
+    try {
+      await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
+      await targetTrigger.click();
+      await page.waitForTimeout(1_000);
+
+      // Try to find option containing the target title (partial match)
+      const targetOption = page.getByRole("option").filter({ hasText: input.targetTitle });
+      const optionCount = await targetOption.count();
+
+      if (optionCount > 0) {
+        await targetOption.first().click();
+        await page.getByRole("listbox").waitFor({ state: "hidden", timeout: 3_000 }).catch(() => {});
+        targetSelected = true;
+      }
+    } catch {
+      console.log("[Dep] Locator approach failed for target dropdown");
+    }
+
+    // Fallback: evaluate with scroll and partial match
+    if (!targetSelected) {
+      console.log("[Dep] Trying evaluate fallback for target selection...");
+
+      // Click trigger via evaluate
+      await page.evaluate(() => {
+        const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
+        if (btn) btn.click();
+      });
+      await page.waitForTimeout(1_000);
+
+      // Find and click option containing target title
+      targetSelected = await page.evaluate((title) => {
+        const options = document.querySelectorAll('[role="option"]');
+        for (const opt of options) {
+          if (opt.textContent?.includes(title)) {
+            (opt as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, input.targetTitle);
+
+      // If still not found, try scrolling through options
+      if (!targetSelected) {
+        console.log("[Dep] Direct click failed — trying scroll approach...");
+        await page.waitForTimeout(500);
+
+        // Scroll down in the listbox to find more options
+        targetSelected = await page.evaluate((title) => {
+          const listbox = document.querySelector('[role="listbox"]');
+          if (listbox) {
+            // Scroll to bottom to load all options
+            listbox.scrollTop = listbox.scrollHeight;
+          }
+
+          // Wait a moment then check again
+          const options = document.querySelectorAll('[role="option"]');
+          for (const opt of options) {
+            if (opt.textContent?.includes(title)) {
+              (opt as HTMLElement).click();
+              return true;
+            }
+          }
+          return false;
+        }, input.targetTitle);
+      }
+    }
 
     if (targetSelected) {
       steps.push({ step: "select_target", status: "pass", detail: `Target: "${input.targetTitle}"` });
