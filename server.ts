@@ -532,131 +532,107 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
 
     let targetSelected = false;
 
-    // Approach 1: Click trigger, wait, then type to search within dropdown
-    try {
-      const targetTrigger = page.getByTestId("select-target-risk");
-      await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
-      await targetTrigger.click();
-      await page.waitForTimeout(1_500);
+    // Click the target dropdown trigger
+    const targetTrigger = page.getByTestId("select-target-risk");
+    await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
+    await targetTrigger.click();
+    await page.waitForTimeout(2_000);
 
-      // Type the target title to filter/search within the dropdown
-      await page.keyboard.type(input.targetTitle.substring(0, 15), { delay: 50 });
-      await page.waitForTimeout(1_000);
+    // Debug: log what's in the DOM after clicking
+    const debugInfo = await page.evaluate(() => {
+      const portal = document.querySelector('[data-radix-popper-content-wrapper]');
+      const portalHTML = portal ? portal.innerHTML.substring(0, 500) : "no portal found";
+      
+      const allDivs = document.querySelectorAll('[role="option"], [data-radix-collection-item], [cmdk-item], [data-value]');
+      const count = allDivs.length;
+      
+      // Check for any floating/portal elements
+      const floats = document.querySelectorAll('[data-radix-popper-content-wrapper], [data-radix-portal], [data-side], [data-state="open"]');
+      const floatTags: string[] = [];
+      floats.forEach(f => floatTags.push(`${f.tagName}.${f.className?.substring(0, 30)} role=${f.getAttribute('role')}`));
 
-      // Now try to find the option
-      const targetOption = page.getByRole("option").filter({ hasText: input.targetTitle });
-      const count = await targetOption.count();
-      console.log(`[Dep] Found ${count} matching options after typing`);
-
-      if (count > 0) {
-        await targetOption.first().click();
-        targetSelected = true;
-        console.log("[Dep] Target selected via type-to-search");
+      // Get all visible text items that look like risk names
+      const textItems: string[] = [];
+      const allElements = document.querySelectorAll('*');
+      for (const el of allElements) {
+        const text = el.textContent?.trim() || "";
+        if (text.includes("Score:") && el.children.length <= 2 && text.length < 100) {
+          textItems.push(`${el.tagName}[role=${el.getAttribute('role')}] "${text}"`);
+        }
       }
-    } catch (err) {
-      console.log(`[Dep] Approach 1 (type-to-search) failed: ${(err as Error).message}`);
+
+      return { portalHTML, optionCount: count, floats: floatTags, textItems };
+    });
+
+    console.log(`[Dep] DEBUG — Options found: ${debugInfo.optionCount}`);
+    console.log(`[Dep] DEBUG — Portal: ${debugInfo.portalHTML}`);
+    console.log(`[Dep] DEBUG — Floats: ${JSON.stringify(debugInfo.floats)}`);
+    console.log(`[Dep] DEBUG — Text items: ${JSON.stringify(debugInfo.textItems)}`);
+
+    // Now try to find and click the target option using various selectors
+    targetSelected = await page.evaluate((title) => {
+      // Strategy 1: Find by role="option"
+      const options = document.querySelectorAll('[role="option"]');
+      for (const opt of options) {
+        if (opt.textContent?.includes(title)) { (opt as HTMLElement).click(); return true; }
+      }
+
+      // Strategy 2: Find by data-radix-collection-item
+      const radixItems = document.querySelectorAll('[data-radix-collection-item]');
+      for (const item of radixItems) {
+        if (item.textContent?.includes(title)) { (item as HTMLElement).click(); return true; }
+      }
+
+      // Strategy 3: Find by data-value
+      const valueItems = document.querySelectorAll('[data-value]');
+      for (const item of valueItems) {
+        if (item.textContent?.includes(title)) { (item as HTMLElement).click(); return true; }
+      }
+
+      // Strategy 4: Find any element with Score: and matching title
+      const allElements = document.querySelectorAll('*');
+      for (const el of allElements) {
+        const text = el.textContent?.trim() || "";
+        if (text.includes(title) && text.includes("Score:") && el.children.length <= 2) {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+
+      // Strategy 5: Find any clickable element containing the title
+      for (const el of allElements) {
+        const text = el.textContent?.trim() || "";
+        if (text.includes(title) && el.children.length === 0 && text.length < 100) {
+          (el as HTMLElement).click();
+          return true;
+        }
+      }
+
+      return false;
+    }, input.targetTitle);
+
+    if (!targetSelected) {
+      // Strategy 6: Try using Playwright locator with text match
+      try {
+        const optionByText = page.locator(`text=${input.targetTitle}`).first();
+        if (await optionByText.isVisible().catch(() => false)) {
+          await optionByText.click();
+          targetSelected = true;
+          console.log("[Dep] Target selected via Playwright text locator");
+        }
+      } catch {
+        console.log("[Dep] Playwright text locator failed");
+      }
     }
 
-    // Approach 2: Close and reopen, try clicking option directly via evaluate
-    if (!targetSelected) {
-      console.log("[Dep] Trying approach 2 — reopen and evaluate...");
-
-      // Press Escape to close any open dropdown
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(500);
-
-      // Click trigger again
-      await page.evaluate(() => {
-        const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
-        if (btn) btn.click();
-      });
-      await page.waitForTimeout(1_500);
-
-      // Try scrolling the viewport and clicking
-      targetSelected = await page.evaluate((title) => {
-        // Check all options currently in DOM
-        const options = document.querySelectorAll('[role="option"]');
-        console.log(`Found ${options.length} options in DOM`);
-
-        for (const opt of options) {
-          const text = opt.textContent?.trim() || "";
-          if (text.includes(title)) {
-            (opt as HTMLElement).click();
-            return true;
-          }
-        }
-
-        // Try scrolling the listbox
-        const listbox = document.querySelector('[role="listbox"]');
-        if (listbox) {
-          // Scroll in increments
-          for (let scroll = 0; scroll < 2000; scroll += 200) {
-            listbox.scrollTop = scroll;
-            const opts = document.querySelectorAll('[role="option"]');
-            for (const opt of opts) {
-              if (opt.textContent?.trim().includes(title)) {
-                (opt as HTMLElement).click();
-                return true;
-              }
-            }
-          }
-        }
-
-        return false;
-      }, input.targetTitle);
-
-      if (targetSelected) {
-        console.log("[Dep] Target selected via approach 2");
-      }
-    }
-
-    // Approach 3: Use keyboard navigation — arrow down through options
-    if (!targetSelected) {
-      console.log("[Dep] Trying approach 3 — keyboard navigation...");
-
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(500);
-
-      const targetTrigger = page.getByTestId("select-target-risk");
-      await targetTrigger.click();
+    // Verify selection took effect
+    if (targetSelected) {
       await page.waitForTimeout(1_000);
-
-      // Press arrow down up to 50 times, checking each option
-      for (let i = 0; i < 50; i++) {
-        await page.keyboard.press("ArrowDown");
-        await page.waitForTimeout(100);
-
-        // Check if the highlighted/focused option contains our title
-        const highlighted = await page.evaluate((title) => {
-          const focused = document.querySelector('[role="option"][data-highlighted]') ||
-                          document.querySelector('[role="option"][aria-selected="true"]') ||
-                          document.querySelector('[role="option"]:focus');
-          if (focused && focused.textContent?.includes(title)) {
-            (focused as HTMLElement).click();
-            return true;
-          }
-          return false;
-        }, input.targetTitle);
-
-        if (highlighted) {
-          targetSelected = true;
-          console.log(`[Dep] Target selected via keyboard after ${i + 1} arrow presses`);
-          break;
-        }
-      }
-
-      // If keyboard highlighted it, press Enter to confirm
-      if (!targetSelected) {
-        // Try pressing Enter on current highlighted option
-        await page.keyboard.press("Enter");
-        await page.waitForTimeout(500);
-
-        // Check if target was selected
-        const currentText = await page.getByTestId("select-target-risk").textContent();
-        if (currentText?.includes(input.targetTitle)) {
-          targetSelected = true;
-          console.log("[Dep] Target selected via Enter key");
-        }
+      const currentText = await targetTrigger.textContent();
+      if (currentText?.includes(input.targetTitle)) {
+        console.log(`[Dep] Target confirmed: "${currentText?.trim()}"`);
+      } else {
+        console.log(`[Dep] Target trigger text after click: "${currentText?.trim()}" — may not have selected correctly`);
       }
     }
 
