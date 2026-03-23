@@ -528,150 +528,158 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
     }
 
     // ── Step 9: Select Target Risk ─────────────────────────────────────────
-    // This dropdown uses a virtual hover-scroll that doesn't work in headless mode
-    // Strategy: Use Playwright to programmatically trigger the selection
+    // The target dropdown uses a Radix Select with virtual scroll
+    // Strategy: Click trigger + find option in one atomic operation
     console.log(`[Dep] Selecting target risk: "${input.targetTitle}"...`);
 
     let targetSelected = false;
 
-    // Approach 1: Click trigger, then immediately use keyboard to navigate
-    try {
-      const targetTrigger = page.getByTestId("select-target-risk");
-      await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
-      
-      // Focus the trigger and use keyboard to open and navigate
-      await targetTrigger.focus();
-      await page.waitForTimeout(500);
-      
-      // Press Space or Enter to open the dropdown
-      await page.keyboard.press("Space");
-      await page.waitForTimeout(1_000);
+    // Step A: Click trigger and wait for portal to render
+    await page.evaluate(() => {
+      const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
+      if (btn) btn.click();
+    });
 
-      // Now try to find and click the option in the open state
-      const found = await page.evaluate((title) => {
-        // Look for any element in the entire document containing the target title
-        const allElements = document.querySelectorAll('*');
-        for (const el of allElements) {
-          const text = el.textContent?.trim() || "";
-          // Match elements that contain the title and look like dropdown items
-          if (text.includes(title) && text.includes("Score:") && el.children.length <= 3 && text.length < 150) {
-            // Check if this element is inside a portal/popover (not the trigger itself)
-            const isInTrigger = el.closest('[data-testid="select-target-risk"]');
-            if (!isInTrigger) {
-              (el as HTMLElement).click();
+    // Give the dropdown time to fully render its portal and items
+    await page.waitForTimeout(2_000);
+
+    // Step B: Take debug screenshot to see dropdown state
+    const dropdownShot = await page.screenshot({ fullPage: true });
+    await uploadScreenshot(dropdownShot, "dep_dropdown_state");
+
+    // Step C: Log everything in the portal
+    const portalInfo = await page.evaluate(() => {
+      // Find ALL portals/popovers
+      const portals = document.querySelectorAll('[data-radix-popper-content-wrapper], [data-radix-portal], [role="listbox"], [data-state="open"]');
+      const info: string[] = [];
+
+      portals.forEach((p, i) => {
+        info.push(`Portal ${i}: tag=${p.tagName} role=${p.getAttribute('role')} state=${p.getAttribute('data-state')} childCount=${p.children.length} text="${p.textContent?.substring(0, 200)}"`);
+      });
+
+      // Also check for any Select content
+      const selectContent = document.querySelectorAll('[class*="SelectContent"], [class*="select-content"], [data-radix-select-content]');
+      selectContent.forEach((s, i) => {
+        info.push(`SelectContent ${i}: tag=${s.tagName} childCount=${s.children.length}`);
+      });
+
+      // Check viewport
+      const viewport = document.querySelectorAll('[data-radix-select-viewport]');
+      viewport.forEach((v, i) => {
+        info.push(`Viewport ${i}: tag=${v.tagName} childCount=${v.children.length} scrollH=${(v as HTMLElement).scrollHeight} clientH=${(v as HTMLElement).clientHeight}`);
+        // Log first few children
+        for (let c = 0; c < Math.min(3, v.children.length); c++) {
+          info.push(`  Child ${c}: tag=${v.children[c].tagName} role=${v.children[c].getAttribute('role')} text="${v.children[c].textContent?.substring(0, 80)}"`);
+        }
+      });
+
+      return info.join('\n');
+    });
+
+    console.log(`[Dep] Portal analysis:\n${portalInfo}`);
+
+    // Step D: Try to find items using data-radix-select-viewport children
+    targetSelected = await page.evaluate((title) => {
+      // Strategy 1: Radix Select viewport items
+      const viewport = document.querySelector('[data-radix-select-viewport]');
+      if (viewport) {
+        const items = viewport.querySelectorAll('[role="option"], [data-radix-collection-item], div');
+        for (const item of items) {
+          if (item.textContent?.includes(title)) {
+            (item as HTMLElement).click();
+            return true;
+          }
+        }
+
+        // Try scrolling the viewport to find the item
+        for (let scroll = 0; scroll < 5000; scroll += 100) {
+          (viewport as HTMLElement).scrollTop = scroll;
+          const newItems = viewport.querySelectorAll('[role="option"], [data-radix-collection-item], div');
+          for (const item of newItems) {
+            if (item.textContent?.includes(title)) {
+              (item as HTMLElement).click();
               return true;
             }
           }
         }
-        return false;
-      }, input.targetTitle);
-
-      if (found) {
-        targetSelected = true;
-        console.log("[Dep] Target selected via Space + evaluate");
       }
-    } catch (err) {
-      console.log(`[Dep] Approach 1 failed: ${(err as Error).message}`);
-    }
 
-    // Approach 2: Use dispatchEvent to simulate the Radix Select onValueChange
-    if (!targetSelected) {
-      console.log("[Dep] Trying Radix value change approach...");
-
-      // Close any open dropdown first
-      await page.keyboard.press("Escape");
-      await page.waitForTimeout(500);
-
-      // Click to open
-      await page.evaluate(() => {
-        const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
-        if (btn) btn.click();
-      });
-      await page.waitForTimeout(1_500);
-
-      // Take a screenshot to see current state
-      const debugShot = await page.screenshot({ fullPage: true });
-      await uploadScreenshot(debugShot, "dep_dropdown_debug");
-
-      // Log everything visible in the dropdown area
-      const dropdownContent = await page.evaluate(() => {
-        const portal = document.querySelector('[data-radix-popper-content-wrapper]');
-        if (!portal) return "No portal";
-        
-        const items: string[] = [];
-        const allChildren = portal.querySelectorAll('*');
-        for (const child of allChildren) {
-          if (child.children.length === 0 && child.textContent?.trim()) {
-            items.push(`${child.tagName}[${child.getAttribute('role') || 'no-role'}]: "${child.textContent.trim().substring(0, 80)}"`);
+      // Strategy 2: Any listbox children
+      const listboxes = document.querySelectorAll('[role="listbox"]');
+      for (const lb of listboxes) {
+        const state = lb.getAttribute('data-state');
+        if (state === 'open') {
+          const items = lb.querySelectorAll('*');
+          for (const item of items) {
+            if (item.textContent?.includes(title) && item.children.length <= 3) {
+              (item as HTMLElement).click();
+              return true;
+            }
           }
         }
-        return items.join('\n');
-      });
-      console.log(`[Dep] Dropdown content:\n${dropdownContent}`);
+      }
 
-      // Try clicking any visible text that matches
-      targetSelected = await page.evaluate((title) => {
-        const portal = document.querySelector('[data-radix-popper-content-wrapper]');
-        if (!portal) return false;
-
-        const allChildren = portal.querySelectorAll('*');
-        for (const child of allChildren) {
-          const text = child.textContent?.trim() || "";
-          if (text.includes(title)) {
-            (child as HTMLElement).click();
+      // Strategy 3: Any portal content
+      const poppers = document.querySelectorAll('[data-radix-popper-content-wrapper]');
+      for (const popper of poppers) {
+        const items = popper.querySelectorAll('*');
+        for (const item of items) {
+          const text = item.textContent?.trim() || "";
+          if (text.includes(title) && item.children.length <= 3 && text.length < 150) {
+            (item as HTMLElement).click();
             return true;
           }
         }
-        return false;
-      }, input.targetTitle);
-
-      if (targetSelected) {
-        console.log("[Dep] Target selected from portal content");
       }
+
+      return false;
+    }, input.targetTitle);
+
+    if (targetSelected) {
+      console.log("[Dep] Target selected from portal/viewport");
     }
 
-    // Approach 3: Scroll the viewport content within the portal
+    // Step E: If still not found, try using Radix Select's internal value mechanism
     if (!targetSelected) {
-      console.log("[Dep] Trying portal scroll approach...");
+      console.log("[Dep] Trying to dispatch value change on select...");
 
-      // The listbox has max-h-96 (384px) but renders at 10px because content is virtualized
-      // Try to force-scroll the content
+      // Find all select items by scrolling
       targetSelected = await page.evaluate((title) => {
-        const viewport = document.querySelector('[data-radix-select-viewport], [role="listbox"] > div, [role="listbox"]');
-        if (!viewport) return false;
+        // Find the select trigger and get its associated content
+        const trigger = document.querySelector('[data-testid="select-target-risk"]');
+        if (!trigger) return false;
 
-        // Force the viewport to a reasonable height
-        (viewport as HTMLElement).style.maxHeight = '400px';
-        (viewport as HTMLElement).style.height = '400px';
-        (viewport as HTMLElement).style.overflow = 'auto';
+        // The listbox id is in aria-controls
+        const listboxId = trigger.getAttribute('aria-controls');
+        if (listboxId) {
+          const listbox = document.getElementById(listboxId);
+          if (listbox) {
+            // Scroll through all items
+            const allChildren = listbox.querySelectorAll('*');
+            for (const child of allChildren) {
+              if (child.textContent?.includes(title) && child.children.length <= 3) {
+                (child as HTMLElement).click();
+                return true;
+              }
+            }
 
-        // Wait and check for items
-        const checkItems = () => {
-          const allElements = document.querySelectorAll('*');
-          for (const el of allElements) {
-            const text = el.textContent?.trim() || "";
-            if (text.includes(title) && text.includes("Score:") && el.children.length <= 3 && text.length < 150) {
-              const isInTrigger = el.closest('[data-testid="select-target-risk"]');
-              if (!isInTrigger) {
-                (el as HTMLElement).click();
+            // Force scroll
+            listbox.scrollTop = listbox.scrollHeight;
+            const newChildren = listbox.querySelectorAll('*');
+            for (const child of newChildren) {
+              if (child.textContent?.includes(title) && child.children.length <= 3) {
+                (child as HTMLElement).click();
                 return true;
               }
             }
           }
-          return false;
-        };
-
-        // Try scrolling the viewport
-        for (let i = 0; i < 20; i++) {
-          (viewport as HTMLElement).scrollTop = i * 50;
-          if (checkItems()) return true;
         }
 
         return false;
       }, input.targetTitle);
 
       if (targetSelected) {
-        console.log("[Dep] Target selected via portal scroll");
+        console.log("[Dep] Target selected via aria-controls listbox");
       }
     }
 
@@ -679,11 +687,7 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
     if (targetSelected) {
       await page.waitForTimeout(1_000);
       const currentText = await page.getByTestId("select-target-risk").textContent().catch(() => "");
-      console.log(`[Dep] Target trigger text after selection: "${currentText?.trim()}"`);
-      if (!currentText?.includes(input.targetTitle)) {
-        console.log("[Dep] Warning — selection may not have registered");
-        // Still mark as selected since click was registered
-      }
+      console.log(`[Dep] Target trigger after selection: "${currentText?.trim()}"`);
     }
 
     if (targetSelected) {
