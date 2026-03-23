@@ -536,92 +536,113 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
     const targetTrigger = page.getByTestId("select-target-risk");
     await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
     await targetTrigger.click();
-    await page.waitForTimeout(2_000);
+    await page.waitForTimeout(1_500);
 
-    // Debug: log what's in the DOM after clicking
-    const debugInfo = await page.evaluate(() => {
-      const portal = document.querySelector('[data-radix-popper-content-wrapper]');
-      const portalHTML = portal ? portal.innerHTML.substring(0, 500) : "no portal found";
-      
-      const allDivs = document.querySelectorAll('[role="option"], [data-radix-collection-item], [cmdk-item], [data-value]');
-      const count = allDivs.length;
-      
-      // Check for any floating/portal elements
-      const floats = document.querySelectorAll('[data-radix-popper-content-wrapper], [data-radix-portal], [data-side], [data-state="open"]');
-      const floatTags: string[] = [];
-      floats.forEach(f => floatTags.push(`${f.tagName}.${f.className?.substring(0, 30)} role=${f.getAttribute('role')}`));
+    // This dropdown uses a virtual scroll with hover-arrows
+    // Options only render when visible in the scroll viewport
+    // Strategy: Find the listbox, hover on scroll-down arrow to load items,
+    // then find and click the matching option
 
-      // Get all visible text items that look like risk names
-      const textItems: string[] = [];
-      const allElements = document.querySelectorAll('*');
-      for (const el of allElements) {
-        const text = el.textContent?.trim() || "";
-        if (text.includes("Score:") && el.children.length <= 2 && text.length < 100) {
-          textItems.push(`${el.tagName}[role=${el.getAttribute('role')}] "${text}"`);
+    // Step A: Find the open listbox portal
+    const listbox = page.locator('[role="listbox"][data-state="open"]').first();
+    const listboxVisible = await listbox.isVisible().catch(() => false);
+    console.log(`[Dep] Listbox visible: ${listboxVisible}`);
+
+    if (listboxVisible) {
+      // Step B: Get the listbox bounding box for hover positions
+      const box = await listbox.boundingBox();
+
+      if (box) {
+        console.log(`[Dep] Listbox bounds: x=${box.x} y=${box.y} w=${box.width} h=${box.height}`);
+
+        // Step C: Hover near the bottom of the listbox to trigger scroll-down
+        // The scroll arrows appear when hovering near top/bottom edges
+        // We need to scroll through all items to find our target
+
+        for (let scrollAttempt = 0; scrollAttempt < 30; scrollAttempt++) {
+          // Check if target option is now visible
+          const found = await page.evaluate((title) => {
+            const listbox = document.querySelector('[role="listbox"][data-state="open"]');
+            if (!listbox) return false;
+
+            const children = listbox.querySelectorAll('*');
+            for (const child of children) {
+              const text = child.textContent?.trim() || "";
+              if (text.includes(title) && child.children.length <= 2 && text.length < 100) {
+                (child as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          }, input.targetTitle);
+
+          if (found) {
+            targetSelected = true;
+            console.log(`[Dep] Target found and clicked after ${scrollAttempt} scroll attempts`);
+            break;
+          }
+
+          // Hover near the bottom edge of the listbox to trigger scroll down
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height - 10);
+          await page.waitForTimeout(300);
+        }
+
+        // If hovering didn't work, try mouse wheel scroll
+        if (!targetSelected) {
+          console.log("[Dep] Hover scroll didn't work, trying mouse wheel...");
+
+          // Move mouse to center of listbox
+          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+          await page.waitForTimeout(200);
+
+          for (let wheelAttempt = 0; wheelAttempt < 20; wheelAttempt++) {
+            // Scroll down
+            await page.mouse.wheel(0, 100);
+            await page.waitForTimeout(300);
+
+            const found = await page.evaluate((title) => {
+              const listbox = document.querySelector('[role="listbox"][data-state="open"]');
+              if (!listbox) return false;
+
+              const children = listbox.querySelectorAll('*');
+              for (const child of children) {
+                const text = child.textContent?.trim() || "";
+                if (text.includes(title) && child.children.length <= 2 && text.length < 100) {
+                  (child as HTMLElement).click();
+                  return true;
+                }
+              }
+              return false;
+            }, input.targetTitle);
+
+            if (found) {
+              targetSelected = true;
+              console.log(`[Dep] Target found via wheel scroll after ${wheelAttempt} attempts`);
+              break;
+            }
+          }
         }
       }
+    }
 
-      return { portalHTML, optionCount: count, floats: floatTags, textItems };
-    });
-
-    console.log(`[Dep] DEBUG — Options found: ${debugInfo.optionCount}`);
-    console.log(`[Dep] DEBUG — Portal: ${debugInfo.portalHTML}`);
-    console.log(`[Dep] DEBUG — Floats: ${JSON.stringify(debugInfo.floats)}`);
-    console.log(`[Dep] DEBUG — Text items: ${JSON.stringify(debugInfo.textItems)}`);
-
-    // Now try to find and click the target option using various selectors
-    targetSelected = await page.evaluate((title) => {
-      // Strategy 1: Find by role="option"
-      const options = document.querySelectorAll('[role="option"]');
-      for (const opt of options) {
-        if (opt.textContent?.includes(title)) { (opt as HTMLElement).click(); return true; }
-      }
-
-      // Strategy 2: Find by data-radix-collection-item
-      const radixItems = document.querySelectorAll('[data-radix-collection-item]');
-      for (const item of radixItems) {
-        if (item.textContent?.includes(title)) { (item as HTMLElement).click(); return true; }
-      }
-
-      // Strategy 3: Find by data-value
-      const valueItems = document.querySelectorAll('[data-value]');
-      for (const item of valueItems) {
-        if (item.textContent?.includes(title)) { (item as HTMLElement).click(); return true; }
-      }
-
-      // Strategy 4: Find any element with Score: and matching title
-      const allElements = document.querySelectorAll('*');
-      for (const el of allElements) {
-        const text = el.textContent?.trim() || "";
-        if (text.includes(title) && text.includes("Score:") && el.children.length <= 2) {
-          (el as HTMLElement).click();
-          return true;
-        }
-      }
-
-      // Strategy 5: Find any clickable element containing the title
-      for (const el of allElements) {
-        const text = el.textContent?.trim() || "";
-        if (text.includes(title) && el.children.length === 0 && text.length < 100) {
-          (el as HTMLElement).click();
-          return true;
-        }
-      }
-
-      return false;
-    }, input.targetTitle);
-
+    // Final fallback: Try Playwright text locator
     if (!targetSelected) {
-      // Strategy 6: Try using Playwright locator with text match
+      console.log("[Dep] Trying Playwright text locator as final fallback...");
       try {
+        // Close and reopen dropdown
+        await page.keyboard.press("Escape");
+        await page.waitForTimeout(500);
+        await targetTrigger.click();
+        await page.waitForTimeout(1_500);
+
         const optionByText = page.locator(`text=${input.targetTitle}`).first();
-        if (await optionByText.isVisible().catch(() => false)) {
+        if (await optionByText.isVisible({ timeout: 3_000 }).catch(() => false)) {
           await optionByText.click();
           targetSelected = true;
-          console.log("[Dep] Target selected via Playwright text locator");
+          console.log("[Dep] Target selected via final text locator fallback");
         }
       } catch {
-        console.log("[Dep] Playwright text locator failed");
+        console.log("[Dep] Final fallback also failed");
       }
     }
 
@@ -632,7 +653,8 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
       if (currentText?.includes(input.targetTitle)) {
         console.log(`[Dep] Target confirmed: "${currentText?.trim()}"`);
       } else {
-        console.log(`[Dep] Target trigger text after click: "${currentText?.trim()}" — may not have selected correctly`);
+        console.log(`[Dep] Warning — trigger text: "${currentText?.trim()}" — checking if click registered`);
+        // Selection might have worked but trigger text didn't update yet
       }
     }
 
