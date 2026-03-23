@@ -528,133 +528,161 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
     }
 
     // ── Step 9: Select Target Risk ─────────────────────────────────────────
+    // This dropdown uses a virtual hover-scroll that doesn't work in headless mode
+    // Strategy: Use Playwright to programmatically trigger the selection
     console.log(`[Dep] Selecting target risk: "${input.targetTitle}"...`);
 
     let targetSelected = false;
 
-    // Click the target dropdown trigger
-    const targetTrigger = page.getByTestId("select-target-risk");
-    await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
-    await targetTrigger.click();
-    await page.waitForTimeout(1_500);
+    // Approach 1: Click trigger, then immediately use keyboard to navigate
+    try {
+      const targetTrigger = page.getByTestId("select-target-risk");
+      await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
+      
+      // Focus the trigger and use keyboard to open and navigate
+      await targetTrigger.focus();
+      await page.waitForTimeout(500);
+      
+      // Press Space or Enter to open the dropdown
+      await page.keyboard.press("Space");
+      await page.waitForTimeout(1_000);
 
-    // This dropdown uses a virtual scroll with hover-arrows
-    // Options only render when visible in the scroll viewport
-    // Strategy: Find the listbox, hover on scroll-down arrow to load items,
-    // then find and click the matching option
+      // Now try to find and click the option in the open state
+      const found = await page.evaluate((title) => {
+        // Look for any element in the entire document containing the target title
+        const allElements = document.querySelectorAll('*');
+        for (const el of allElements) {
+          const text = el.textContent?.trim() || "";
+          // Match elements that contain the title and look like dropdown items
+          if (text.includes(title) && text.includes("Score:") && el.children.length <= 3 && text.length < 150) {
+            // Check if this element is inside a portal/popover (not the trigger itself)
+            const isInTrigger = el.closest('[data-testid="select-target-risk"]');
+            if (!isInTrigger) {
+              (el as HTMLElement).click();
+              return true;
+            }
+          }
+        }
+        return false;
+      }, input.targetTitle);
 
-    // Step A: Find the open listbox portal
-    const listbox = page.locator('[role="listbox"][data-state="open"]').first();
-    const listboxVisible = await listbox.isVisible().catch(() => false);
-    console.log(`[Dep] Listbox visible: ${listboxVisible}`);
+      if (found) {
+        targetSelected = true;
+        console.log("[Dep] Target selected via Space + evaluate");
+      }
+    } catch (err) {
+      console.log(`[Dep] Approach 1 failed: ${(err as Error).message}`);
+    }
 
-    if (listboxVisible) {
-      // Step B: Get the listbox bounding box for hover positions
-      const box = await listbox.boundingBox();
+    // Approach 2: Use dispatchEvent to simulate the Radix Select onValueChange
+    if (!targetSelected) {
+      console.log("[Dep] Trying Radix value change approach...");
 
-      if (box) {
-        console.log(`[Dep] Listbox bounds: x=${box.x} y=${box.y} w=${box.width} h=${box.height}`);
+      // Close any open dropdown first
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
 
-        // Step C: Hover near the bottom of the listbox to trigger scroll-down
-        // The scroll arrows appear when hovering near top/bottom edges
-        // We need to scroll through all items to find our target
+      // Click to open
+      await page.evaluate(() => {
+        const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
+        if (btn) btn.click();
+      });
+      await page.waitForTimeout(1_500);
 
-        for (let scrollAttempt = 0; scrollAttempt < 30; scrollAttempt++) {
-          // Check if target option is now visible
-          const found = await page.evaluate((title) => {
-            const listbox = document.querySelector('[role="listbox"][data-state="open"]');
-            if (!listbox) return false;
+      // Take a screenshot to see current state
+      const debugShot = await page.screenshot({ fullPage: true });
+      await uploadScreenshot(debugShot, "dep_dropdown_debug");
 
-            const children = listbox.querySelectorAll('*');
-            for (const child of children) {
-              const text = child.textContent?.trim() || "";
-              if (text.includes(title) && child.children.length <= 2 && text.length < 100) {
-                (child as HTMLElement).click();
+      // Log everything visible in the dropdown area
+      const dropdownContent = await page.evaluate(() => {
+        const portal = document.querySelector('[data-radix-popper-content-wrapper]');
+        if (!portal) return "No portal";
+        
+        const items: string[] = [];
+        const allChildren = portal.querySelectorAll('*');
+        for (const child of allChildren) {
+          if (child.children.length === 0 && child.textContent?.trim()) {
+            items.push(`${child.tagName}[${child.getAttribute('role') || 'no-role'}]: "${child.textContent.trim().substring(0, 80)}"`);
+          }
+        }
+        return items.join('\n');
+      });
+      console.log(`[Dep] Dropdown content:\n${dropdownContent}`);
+
+      // Try clicking any visible text that matches
+      targetSelected = await page.evaluate((title) => {
+        const portal = document.querySelector('[data-radix-popper-content-wrapper]');
+        if (!portal) return false;
+
+        const allChildren = portal.querySelectorAll('*');
+        for (const child of allChildren) {
+          const text = child.textContent?.trim() || "";
+          if (text.includes(title)) {
+            (child as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, input.targetTitle);
+
+      if (targetSelected) {
+        console.log("[Dep] Target selected from portal content");
+      }
+    }
+
+    // Approach 3: Scroll the viewport content within the portal
+    if (!targetSelected) {
+      console.log("[Dep] Trying portal scroll approach...");
+
+      // The listbox has max-h-96 (384px) but renders at 10px because content is virtualized
+      // Try to force-scroll the content
+      targetSelected = await page.evaluate((title) => {
+        const viewport = document.querySelector('[data-radix-select-viewport], [role="listbox"] > div, [role="listbox"]');
+        if (!viewport) return false;
+
+        // Force the viewport to a reasonable height
+        (viewport as HTMLElement).style.maxHeight = '400px';
+        (viewport as HTMLElement).style.height = '400px';
+        (viewport as HTMLElement).style.overflow = 'auto';
+
+        // Wait and check for items
+        const checkItems = () => {
+          const allElements = document.querySelectorAll('*');
+          for (const el of allElements) {
+            const text = el.textContent?.trim() || "";
+            if (text.includes(title) && text.includes("Score:") && el.children.length <= 3 && text.length < 150) {
+              const isInTrigger = el.closest('[data-testid="select-target-risk"]');
+              if (!isInTrigger) {
+                (el as HTMLElement).click();
                 return true;
               }
             }
-            return false;
-          }, input.targetTitle);
-
-          if (found) {
-            targetSelected = true;
-            console.log(`[Dep] Target found and clicked after ${scrollAttempt} scroll attempts`);
-            break;
           }
+          return false;
+        };
 
-          // Hover near the bottom edge of the listbox to trigger scroll down
-          await page.mouse.move(box.x + box.width / 2, box.y + box.height - 10);
-          await page.waitForTimeout(300);
+        // Try scrolling the viewport
+        for (let i = 0; i < 20; i++) {
+          (viewport as HTMLElement).scrollTop = i * 50;
+          if (checkItems()) return true;
         }
 
-        // If hovering didn't work, try mouse wheel scroll
-        if (!targetSelected) {
-          console.log("[Dep] Hover scroll didn't work, trying mouse wheel...");
+        return false;
+      }, input.targetTitle);
 
-          // Move mouse to center of listbox
-          await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-          await page.waitForTimeout(200);
-
-          for (let wheelAttempt = 0; wheelAttempt < 20; wheelAttempt++) {
-            // Scroll down
-            await page.mouse.wheel(0, 100);
-            await page.waitForTimeout(300);
-
-            const found = await page.evaluate((title) => {
-              const listbox = document.querySelector('[role="listbox"][data-state="open"]');
-              if (!listbox) return false;
-
-              const children = listbox.querySelectorAll('*');
-              for (const child of children) {
-                const text = child.textContent?.trim() || "";
-                if (text.includes(title) && child.children.length <= 2 && text.length < 100) {
-                  (child as HTMLElement).click();
-                  return true;
-                }
-              }
-              return false;
-            }, input.targetTitle);
-
-            if (found) {
-              targetSelected = true;
-              console.log(`[Dep] Target found via wheel scroll after ${wheelAttempt} attempts`);
-              break;
-            }
-          }
-        }
+      if (targetSelected) {
+        console.log("[Dep] Target selected via portal scroll");
       }
     }
 
-    // Final fallback: Try Playwright text locator
-    if (!targetSelected) {
-      console.log("[Dep] Trying Playwright text locator as final fallback...");
-      try {
-        // Close and reopen dropdown
-        await page.keyboard.press("Escape");
-        await page.waitForTimeout(500);
-        await targetTrigger.click();
-        await page.waitForTimeout(1_500);
-
-        const optionByText = page.locator(`text=${input.targetTitle}`).first();
-        if (await optionByText.isVisible({ timeout: 3_000 }).catch(() => false)) {
-          await optionByText.click();
-          targetSelected = true;
-          console.log("[Dep] Target selected via final text locator fallback");
-        }
-      } catch {
-        console.log("[Dep] Final fallback also failed");
-      }
-    }
-
-    // Verify selection took effect
+    // Verify selection
     if (targetSelected) {
       await page.waitForTimeout(1_000);
-      const currentText = await targetTrigger.textContent();
-      if (currentText?.includes(input.targetTitle)) {
-        console.log(`[Dep] Target confirmed: "${currentText?.trim()}"`);
-      } else {
-        console.log(`[Dep] Warning — trigger text: "${currentText?.trim()}" — checking if click registered`);
-        // Selection might have worked but trigger text didn't update yet
+      const currentText = await page.getByTestId("select-target-risk").textContent().catch(() => "");
+      console.log(`[Dep] Target trigger text after selection: "${currentText?.trim()}"`);
+      if (!currentText?.includes(input.targetTitle)) {
+        console.log("[Dep] Warning — selection may not have registered");
+        // Still mark as selected since click was registered
       }
     }
 
