@@ -530,81 +530,140 @@ async function performCreateDependency(input: DependencyInput): Promise<Dependen
     // ── Step 9: Select Target Risk ─────────────────────────────────────────
     console.log(`[Dep] Selecting target risk: "${input.targetTitle}"...`);
 
-    // Target dropdown excludes the source risk — use partial text match
-    // Option text includes score like "Dep_Target_20260323 (Score: 9)"
-    const targetTrigger = page.getByTestId("select-target-risk");
     let targetSelected = false;
 
+    // Approach 1: Click trigger, wait, then type to search within dropdown
     try {
+      const targetTrigger = page.getByTestId("select-target-risk");
       await targetTrigger.waitFor({ state: "visible", timeout: 10_000 });
       await targetTrigger.click();
+      await page.waitForTimeout(1_500);
+
+      // Type the target title to filter/search within the dropdown
+      await page.keyboard.type(input.targetTitle.substring(0, 15), { delay: 50 });
       await page.waitForTimeout(1_000);
 
-      // Try to find option containing the target title (partial match)
+      // Now try to find the option
       const targetOption = page.getByRole("option").filter({ hasText: input.targetTitle });
-      const optionCount = await targetOption.count();
+      const count = await targetOption.count();
+      console.log(`[Dep] Found ${count} matching options after typing`);
 
-      if (optionCount > 0) {
+      if (count > 0) {
         await targetOption.first().click();
-        await page.getByRole("listbox").waitFor({ state: "hidden", timeout: 3_000 }).catch(() => {});
         targetSelected = true;
+        console.log("[Dep] Target selected via type-to-search");
       }
-    } catch {
-      console.log("[Dep] Locator approach failed for target dropdown");
+    } catch (err) {
+      console.log(`[Dep] Approach 1 (type-to-search) failed: ${(err as Error).message}`);
     }
 
-    // Fallback: evaluate with scroll and partial match
+    // Approach 2: Close and reopen, try clicking option directly via evaluate
     if (!targetSelected) {
-      console.log("[Dep] Trying evaluate fallback for target selection...");
+      console.log("[Dep] Trying approach 2 — reopen and evaluate...");
 
-      // Click trigger via evaluate
+      // Press Escape to close any open dropdown
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
+
+      // Click trigger again
       await page.evaluate(() => {
         const btn = document.querySelector('[data-testid="select-target-risk"]') as HTMLButtonElement;
         if (btn) btn.click();
       });
-      await page.waitForTimeout(1_000);
+      await page.waitForTimeout(1_500);
 
-      // Find and click option containing target title
+      // Try scrolling the viewport and clicking
       targetSelected = await page.evaluate((title) => {
+        // Check all options currently in DOM
         const options = document.querySelectorAll('[role="option"]');
+        console.log(`Found ${options.length} options in DOM`);
+
         for (const opt of options) {
-          if (opt.textContent?.includes(title)) {
+          const text = opt.textContent?.trim() || "";
+          if (text.includes(title)) {
             (opt as HTMLElement).click();
             return true;
           }
         }
+
+        // Try scrolling the listbox
+        const listbox = document.querySelector('[role="listbox"]');
+        if (listbox) {
+          // Scroll in increments
+          for (let scroll = 0; scroll < 2000; scroll += 200) {
+            listbox.scrollTop = scroll;
+            const opts = document.querySelectorAll('[role="option"]');
+            for (const opt of opts) {
+              if (opt.textContent?.trim().includes(title)) {
+                (opt as HTMLElement).click();
+                return true;
+              }
+            }
+          }
+        }
+
         return false;
       }, input.targetTitle);
 
-      // If still not found, try scrolling through options
-      if (!targetSelected) {
-        console.log("[Dep] Direct click failed — trying scroll approach...");
-        await page.waitForTimeout(500);
+      if (targetSelected) {
+        console.log("[Dep] Target selected via approach 2");
+      }
+    }
 
-        // Scroll down in the listbox to find more options
-        targetSelected = await page.evaluate((title) => {
-          const listbox = document.querySelector('[role="listbox"]');
-          if (listbox) {
-            // Scroll to bottom to load all options
-            listbox.scrollTop = listbox.scrollHeight;
-          }
+    // Approach 3: Use keyboard navigation — arrow down through options
+    if (!targetSelected) {
+      console.log("[Dep] Trying approach 3 — keyboard navigation...");
 
-          // Wait a moment then check again
-          const options = document.querySelectorAll('[role="option"]');
-          for (const opt of options) {
-            if (opt.textContent?.includes(title)) {
-              (opt as HTMLElement).click();
-              return true;
-            }
+      await page.keyboard.press("Escape");
+      await page.waitForTimeout(500);
+
+      const targetTrigger = page.getByTestId("select-target-risk");
+      await targetTrigger.click();
+      await page.waitForTimeout(1_000);
+
+      // Press arrow down up to 50 times, checking each option
+      for (let i = 0; i < 50; i++) {
+        await page.keyboard.press("ArrowDown");
+        await page.waitForTimeout(100);
+
+        // Check if the highlighted/focused option contains our title
+        const highlighted = await page.evaluate((title) => {
+          const focused = document.querySelector('[role="option"][data-highlighted]') ||
+                          document.querySelector('[role="option"][aria-selected="true"]') ||
+                          document.querySelector('[role="option"]:focus');
+          if (focused && focused.textContent?.includes(title)) {
+            (focused as HTMLElement).click();
+            return true;
           }
           return false;
         }, input.targetTitle);
+
+        if (highlighted) {
+          targetSelected = true;
+          console.log(`[Dep] Target selected via keyboard after ${i + 1} arrow presses`);
+          break;
+        }
+      }
+
+      // If keyboard highlighted it, press Enter to confirm
+      if (!targetSelected) {
+        // Try pressing Enter on current highlighted option
+        await page.keyboard.press("Enter");
+        await page.waitForTimeout(500);
+
+        // Check if target was selected
+        const currentText = await page.getByTestId("select-target-risk").textContent();
+        if (currentText?.includes(input.targetTitle)) {
+          targetSelected = true;
+          console.log("[Dep] Target selected via Enter key");
+        }
       }
     }
 
     if (targetSelected) {
       steps.push({ step: "select_target", status: "pass", detail: `Target: "${input.targetTitle}"` });
       console.log(`[Dep] Target selected: "${input.targetTitle}"`);
+      await page.waitForTimeout(500);
     } else {
       steps.push({ step: "select_target", status: "fail", detail: `Failed to select target: "${input.targetTitle}"` });
       result.steps = steps;
